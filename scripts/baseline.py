@@ -12,7 +12,7 @@ def process_file(file_path, output_dir, plot=False):
     x, y = data[:, 0], data[:, 1]
 
     # Apply baseline correction
-    baseline, _ = asls(y, lam=1e4, p=0.315)
+    baseline, _ = asls(y, lam=1e4, p=0.309)
     corrected = y - baseline
 
     # Save corrected spectrum
