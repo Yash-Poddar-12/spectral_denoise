@@ -109,7 +109,8 @@ class ResUNet1D(nn.Module):
 # Loss Function
 # -------------------
 class HybridLoss(nn.Module):
-    def __init__(self, alpha=0.7, beta=0.3):
+    # Using the best performing loss weights
+    def __init__(self, alpha=0.8, beta=0.2):
         super().__init__(); self.alpha, self.beta, self.mse = alpha, beta, nn.MSELoss()
     def forward(self, pred, target):
         mse_loss = self.mse(pred, target)
@@ -123,7 +124,7 @@ class HybridLoss(nn.Module):
 # -------------------
 def train_model(model, train_loader, val_loader, epochs=100, lr=5e-4):
     optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, factor=0.5, patience=5, verbose=True)
     criterion = HybridLoss()
     for epoch in range(1, epochs+1):
         model.train(); train_loss = 0
@@ -161,6 +162,7 @@ def compute_metrics(o, c):
 def evaluate_model():
     print("\nStarting evaluation...")
     model = ResUNet1D(base_ch=64).to(device)
+    # Load the model with weights_only=True for safety
     model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
     model.eval()
     num_params = sum(p.numel() for p in model.parameters())
@@ -189,14 +191,20 @@ def evaluate_model():
     weights = {"mse": 0.2, "psnr": 0.3, "ssim": 0.3, "corr": 0.2}
     overall_quality = (weights["mse"] * mse_quality + weights["psnr"] * psnr_quality + weights["ssim"] * ssim_quality + weights["corr"] * corr_quality)
 
-    print("\n✅ Evaluation Results on Validation Set:")
+    print("\n Evaluation Results on Validation Set:")
     print(f"Mean MSE:   {mean_mse:.6f}\nMean PSNR:  {mean_psnr:.2f} dB\nMean SSIM:  {mean_ssim:.4f}\nMean Corr:  {mean_corr:.4f}")
     print(f"Overall Quality Score: {overall_quality:.2f}%")
 
-    metrics = { "mean_mse": float(mean_mse), "mean_psnr": float(mean_psnr), "mean_ssim": float(mean_ssim), "mean_corr": float(mean_corr), "overall_quality": float(overall_quality) }
+    metrics = { 
+        "mean_mse": float(mean_mse), 
+        "mean_psnr": float(mean_psnr), 
+        "mean_ssim": float(mean_ssim), 
+        "mean_corr": float(mean_corr), 
+        "overall_quality": float(overall_quality),
+        "optimal_baseline_params": {"lam": 1e4, "p": 0.315}
+    }
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
-    with open(results_path, "w") as f:
-        json.dump(metrics, f, indent=4)
+    with open(results_path, "w") as f: json.dump(metrics, f, indent=4)
     print(f"\n📂 Metrics saved to {results_path}")
 
 # -------------------
@@ -210,9 +218,13 @@ if __name__ == "__main__":
     val_dataset = FTIRPairsDataset(val_c, val_n, augment=False)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size)
+    
+    # Use the final optimized model settings
     model = ResUNet1D(base_ch=64).to(device)
-    train_model(model, train_loader, val_loader, epochs=100)
+    train_model(model, train_loader, val_loader, epochs=100, lr=5e-4)
+    
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     torch.save(model.state_dict(), model_path)
-    print(f"\n✅ Final Model saved to {model_path}")
+    print(f"\n Final Model saved to {model_path}")
+    
     evaluate_model()
