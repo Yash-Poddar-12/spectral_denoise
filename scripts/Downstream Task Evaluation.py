@@ -2,58 +2,22 @@ import os
 import sys
 import numpy as np
 import torch
-import torch.nn as nn
 from scipy.signal import savgol_filter
 import pywt
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, f1_score
 
-# --- 1. CORRECT MODEL DEFINITION (Copied from scripts/train_resunet.py) ---
+# Allow running from either the project root or the scripts/ sub-directory
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+_project_root = os.path.dirname(_script_dir)
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
-        super().__init__()
-        self.conv = nn.Sequential(
-            nn.Conv1d(in_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv1d(out_ch, out_ch, kernel_size=3, padding=1),
-            nn.BatchNorm1d(out_ch),
-            nn.ReLU(inplace=True)
-        )
-        self.shortcut = nn.Conv1d(in_ch, out_ch, kernel_size=1)
+from models.resnet_threshold import ResNetThreshold1D
 
-    def forward(self, x):
-        return self.conv(x) + self.shortcut(x)
+# --- 1. DENOISING HELPER FUNCTIONS ---
 
-class ResUNet1D(nn.Module):
-    def __init__(self, in_ch=1, out_ch=1, base_ch=64):
-        super().__init__()
-        self.enc1 = ConvBlock(in_ch, base_ch)
-        self.enc2 = ConvBlock(base_ch, base_ch*2)
-        self.enc3 = ConvBlock(base_ch*2, base_ch*4)
-        self.pool = nn.MaxPool1d(2)
-        self.bottleneck = ConvBlock(base_ch*4, base_ch*8)
-        self.up2 = nn.ConvTranspose1d(base_ch*8, base_ch*4, kernel_size=2, stride=2)
-        self.dec2 = ConvBlock(base_ch*8, base_ch*4)
-        self.up1 = nn.ConvTranspose1d(base_ch*4, base_ch*2, kernel_size=2, stride=2)
-        self.dec1 = ConvBlock(base_ch*4, base_ch*2)
-        self.up0 = nn.ConvTranspose1d(base_ch*2, base_ch, kernel_size=2, stride=2)
-        self.dec0 = ConvBlock(base_ch*2, base_ch)
-        self.final = nn.Conv1d(base_ch, out_ch, kernel_size=1)
-
-    def forward(self, x):
-        e1 = self.enc1(x); e2 = self.enc2(self.pool(e1)); e3 = self.enc3(self.pool(e2))
-        b = self.bottleneck(self.pool(e3))
-        d2 = self.up2(b); d2 = torch.cat([d2, e3], dim=1); d2 = self.dec2(d2)
-        d1 = self.up1(d2); d1 = torch.cat([d1, e2], dim=1); d1 = self.dec1(d1)
-        d0 = self.up0(d1); d0 = torch.cat([d0, e1], dim=1); d0 = self.dec0(d0)
-        out = self.final(d0)
-        return out
-
-# --- 2. DENOISING HELPER FUNCTIONS ---
-
-def denoise_unet(noisy_data_np, model, device):
+def denoise_resnet(noisy_data_np, model, device):
     noisy_tensor = torch.tensor(noisy_data_np, dtype=torch.float32).to(device)
     if noisy_tensor.dim() == 2:
         noisy_tensor = noisy_tensor.unsqueeze(1)
@@ -79,7 +43,7 @@ def denoise_wavelet(noisy_data_np):
         denoised_list.append(pywt.waverec(coeffs_thresh, "sym8", mode="per"))
     return np.array(denoised_list).squeeze()
 
-# --- 3. CLASSIFIER HELPER FUNCTIONS ---
+# --- 2. CLASSIFIER HELPER FUNCTIONS ---
 
 def train_rf(X, y):
     clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
@@ -92,23 +56,23 @@ def eval_rf(clf, X_test, y_test):
     f1 = f1_score(y_test, preds, average='weighted')
     return acc, f1
 
-# --- 4. MAIN EXECUTION ---
+# --- 3. MAIN EXECUTION ---
 
 def run_downstream_evaluation():
     print("--- 1. Setting up paths and device ---")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    project_root = os.getcwd() 
+    project_root = _project_root
     dataset_dir = os.path.join(project_root, "data/dataset")
-    model_path = os.path.join(project_root, "models/resunet1d.pth")
+    model_path = os.path.join(project_root, "models/resnet_threshold1d.pth")
 
     print(f"\n--- 2. Load Model ---")
     try:
-        unet_model = ResUNet1D(base_ch=64).to(device)
-        unet_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        unet_model.eval()
-        print(f"✅ U-Net model loaded successfully from {model_path}.")
+        resnet_model = ResNetThreshold1D(in_channels=1, hidden_channels=64, num_blocks=8).to(device)
+        resnet_model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        resnet_model.eval()
+        print(f"ResNetThreshold1D model loaded successfully from {model_path}.")
     except Exception as e:
         print(f"ERROR: Could not load model. {e}")
         return
@@ -119,70 +83,57 @@ def run_downstream_evaluation():
         Y_val = np.load(os.path.join(dataset_dir, "Y_test.npy"))
         X_train = np.load(os.path.join(dataset_dir, "X_train.npy"))
         Y_train = np.load(os.path.join(dataset_dir, "Y_train.npy"))
-        print(f"✅ Loaded data from {dataset_dir}.")
+        print(f"Loaded data from {dataset_dir}.")
 
-        # --- UPDATED: Load REAL Labels ---
         y_labels_val = np.load(os.path.join(dataset_dir, "Z_test_labels.npy"))
         y_labels_train = np.load(os.path.join(dataset_dir, "Z_train_labels.npy"))
-        print("✅ Loaded REAL classification labels.")
-        # ----------------------------------
+        print("Loaded real classification labels.")
 
     except FileNotFoundError as e:
         print(f"ERROR: Data file or Label file not found. {e}")
         print("Please run the updated 'load_qc.py' script first.")
         return
-    
-    # --- FIX: CROP DATA FOR U-NET COMPATIBILITY ---
-    TARGET_LENGTH = 1864 
-    print(f"\n--- Cropping data from {X_train.shape[1]} to {TARGET_LENGTH} for U-Net compatibility ---")
-    X_train = X_train[:, :TARGET_LENGTH]
-    Y_train = Y_train[:, :TARGET_LENGTH]
-    X_val = X_val[:, :TARGET_LENGTH]
-    Y_val = Y_val[:, :TARGET_LENGTH]
-    print(f"✅ Data cropped successfully. New shape: {X_train.shape}")
-    
+
     print("\n--- 4. Denoise Datasets ---")
     try:
-        # Denoise Validation Set
-        denoised_unet_val = denoise_unet(X_val, unet_model, device)
+        denoised_resnet_val = denoise_resnet(X_val, resnet_model, device)
         denoised_sg_val = denoise_sg(X_val)
         denoised_wavelet_val = denoise_wavelet(X_val)
-        print("✅ Denoised validation set (U-Net, SG, Wavelet).")
+        print("Denoised validation set (ResNetThreshold, SG, Wavelet).")
 
-        # Denoise Training Set
-        denoised_unet_train = denoise_unet(X_train, unet_model, device)
+        denoised_resnet_train = denoise_resnet(X_train, resnet_model, device)
         denoised_sg_train = denoise_sg(X_train)
         denoised_wavelet_train = denoise_wavelet(X_train)
-        print("✅ Denoised training set (U-Net, SG, Wavelet).")
-    
+        print("Denoised training set (ResNetThreshold, SG, Wavelet).")
+
     except RuntimeError as e:
-        print(f"\n--- !!! ERROR during U-Net Denoising: {e} ---")
+        print(f"\n--- ERROR during ResNetThreshold Denoising: {e} ---")
         return
 
     print("\n--- 5. Train and Evaluate Classifiers ---")
-    
+
     clf_noisy = train_rf(X_train, y_labels_train)
     clf_clean = train_rf(Y_train, y_labels_train)
-    clf_unet = train_rf(denoised_unet_train, y_labels_train)
+    clf_resnet = train_rf(denoised_resnet_train, y_labels_train)
     clf_sg = train_rf(denoised_sg_train, y_labels_train)
     clf_wavelet = train_rf(denoised_wavelet_train, y_labels_train)
-    print("✅ Classifiers trained.")
+    print("Classifiers trained.")
 
     acc_noisy, f1_noisy = eval_rf(clf_noisy, X_val, y_labels_val)
     acc_clean, f1_clean = eval_rf(clf_clean, Y_val, y_labels_val)
-    acc_unet, f1_unet = eval_rf(clf_unet, denoised_unet_val, y_labels_val)
+    acc_resnet, f1_resnet = eval_rf(clf_resnet, denoised_resnet_val, y_labels_val)
     acc_sg, f1_sg = eval_rf(clf_sg, denoised_sg_val, y_labels_val)
     acc_wavelet, f1_wavelet = eval_rf(clf_wavelet, denoised_wavelet_val, y_labels_val)
-    print("✅ Classifiers evaluated.")
+    print("Classifiers evaluated.")
 
     print("\n--- 6. Downstream Classification Performance (Random Forest) ---")
-    print("| Input Data Source | Accuracy (↑) | F1-Score (weighted) (↑) |")
-    print("| :--- | :---: | :---: |")
-    print(f"| Noisy (Baseline)  | {acc_noisy:.2%}      | {f1_noisy:.4f}                  |")
-    print(f"| Savitzky-Golay    | {acc_sg:.2%}      | {f1_sg:.4f}                  |")
-    print(f"| Wavelet           | {acc_wavelet:.2%}      | {f1_wavelet:.4f}                  |")
-    print(f"| **1D U-Net (Ours)** | **{acc_unet:.2%}** | **{f1_unet:.4f}** |")
-    print(f"| Clean Target      | {acc_clean:.2%}      | {f1_clean:.4f}                  |")
+    print("| Input Data Source              | Accuracy (↑) | F1-Score (weighted) (↑) |")
+    print("| :---                           | :---:        | :---:                   |")
+    print(f"| Noisy (Baseline)               | {acc_noisy:.2%}      | {f1_noisy:.4f}                  |")
+    print(f"| Savitzky-Golay                 | {acc_sg:.2%}      | {f1_sg:.4f}                  |")
+    print(f"| Wavelet                        | {acc_wavelet:.2%}      | {f1_wavelet:.4f}                  |")
+    print(f"| **ResNetThreshold1D (Ours)**   | **{acc_resnet:.2%}** | **{f1_resnet:.4f}** |")
+    print(f"| Clean Target                   | {acc_clean:.2%}      | {f1_clean:.4f}                  |")
     print("\n--- Analysis Complete ---")
 
 
@@ -190,5 +141,5 @@ if __name__ == "__main__":
     if os.path.basename(os.getcwd()) == 'scripts':
         os.chdir('..')
         print(f"Changed directory to project root: {os.getcwd()}")
-        
+
     run_downstream_evaluation()
