@@ -1,118 +1,128 @@
-# Spectral Denoising using 1D ResUNet
+# Spectral Denoising using ResNetThreshold1D
 
-This project implements a 1D Residual U-Net (ResUNet) for denoising spectral data. The model is trained to remove noise, baseline shifts, and other artifacts from raw spectra, producing a clean version that is more suitable for analysis.
+This project implements a **1D Residual Shrinkage Network** (`ResNetThreshold1D`) for denoising spectral data (FTIR). The model combines residual connections with learnable per-channel soft-thresholding activations, which naturally suppress noise-like coefficients while preserving meaningful spectral features.
 
 ## About The Project
 
-This project provides a complete workflow for training and evaluating a 1D ResUNet model for spectral denoising. The model architecture is based on the U-Net design with residual connections, which helps in training deeper networks and achieving better performance.
+This project provides a complete pipeline for training and evaluating a 1D ResNet with learnable soft-thresholding for spectral denoising. The key innovation over a plain ResNet is the **soft-threshold activation** — each residual block learns its own shrinkage threshold per channel, making the network especially effective at separating signal from noise without a U-Net encoder–decoder structure.
 
-The key components of this project are:
+### Architecture highlights
 
-  - **`scripts/train_resunet.py`**: The main script for training the denoising model.
-  - **`scripts/evaluate_model.py`**: A script to evaluate the performance of the trained model.
-  - **`notebooks/demo_analysis.ipynb`**: A Jupyter notebook demonstrating how to use the trained model for denoising a sample spectrum.
+- **`SoftThreshold`** — learnable per-channel soft-thresholding replaces ReLU in every residual block
+- **`ResidualShrinkageBlock`** — two Conv1d layers with BatchNorm and soft-thresholding, plus identity skip connection
+- **`ResNetThreshold1D`** — head conv → N residual shrinkage blocks → tail conv; uses residual learning (`output = noisy − predicted_noise`)
+
+### Key pipeline components
+
+| Script / Module | Purpose |
+| :--- | :--- |
+| `models/resnet_threshold.py` | Model definition (ResNetThreshold1D) |
+| `scripts/train_resnet_threshold.py` | Train the model |
+| `scripts/evaluate_resnet_threshold.py` | Evaluate the trained model |
+| `scripts/Downstream Task Evaluation.py` | RF classifier comparison (denoising methods) |
+| `scripts/baseline.py` | ASLS baseline correction |
+| `scripts/make_pairs.py` | Build clean/noisy .npy pairs |
+| `scripts/load_qc.py` | QC-checked dataset loader with train/test split |
+| `scripts/augment_data.py` | On-the-fly data augmentation utilities |
+| `scripts/create_noisy_data.py` | Generate synthetic noisy spectra |
+| `scripts/metrics.py` | General metric helpers (PSNR, SSIM, NRMSE) |
+| `scripts/spectral_metrics.py` | Spectral-specific metrics (peak shift, FWHM, band area) |
+| `scripts/classifier_evaluate.py` | Random Forest training and evaluation helpers |
+| `scripts/audit_trail.py` | Timestamped audit logging |
+| `scripts/visualize_results.py` | Overlay plot of raw / corrected / denoised spectra |
 
 ## Getting Started
 
-To get a local copy up and running, follow these simple steps.
-
 ### Prerequisites
 
-This project uses `conda` for environment management. Make sure you have Anaconda or Miniconda installed.
+`conda` (Anaconda or Miniconda) with Python 3.10.
 
 ### Installation
 
-1.  **Clone the repo**
-    ```sh
-    git clone https://github.com/nabhya8013/spectral_denoise.git
-    cd spectral_denoise
-    ```
-2.  **Create and activate the Conda environment**
-    ```sh
-    conda create -n spectral_env python=3.10
-    conda activate spectral_env
-    ```
-3.  **Install the required packages**
-    ```sh
-    pip install -r requirements.txt
-    ```
+1. **Clone the repo**
+   ```sh
+   git clone https://github.com/nabhya8013/spectral_denoise.git
+   cd spectral_denoise
+   ```
+2. **Create and activate the Conda environment**
+   ```sh
+   conda create -n spectral_env python=3.10
+   conda activate spectral_env
+   ```
+3. **Install dependencies**
+   ```sh
+   pip install -r requrements.txt
+   ```
 
-## Usage
+## Data Preparation
 
-To use the pretrained model for denoising your own spectral data, you can adapt the `notebooks/demo_analysis.ipynb` notebook. The basic steps are:
+Place raw `.txt` spectra (two-column: wavenumber, intensity) in `data/raw/` and
+baseline-corrected files in `data/processed/`. Then run:
 
-1.  Load the trained model.
-2.  Load your raw spectral data.
-3.  Preprocess the data (e.g., resampling to the target length of 1024).
-4.  Pass the data through the model to get the denoised spectrum.
+```sh
+python scripts/baseline.py          # baseline-correct raw spectra
+python scripts/make_pairs.py        # create clean/noisy .npy pairs  → data/pairs/
+python scripts/create_noisy_data.py # add synthetic noise to clean spectra
+```
 
-Here's a code snippet from the demo notebook:
+## Training
+
+```sh
+python scripts/train_resnet_threshold.py
+```
+
+The script will:
+
+- Load all `_clean.npy` / `_noisy.npy` pairs from `data/pairs/`
+- Apply on-the-fly augmentation (noise, baseline shifts, spikes)
+- Train `ResNetThreshold1D` with a hybrid MSE + cosine-similarity loss
+- Save the trained model to `models/resnet_threshold1d.pth`
+- Save evaluation metrics to `results/resnet_threshold_metrics.json`
+
+## Evaluation
+
+```sh
+python scripts/evaluate_resnet_threshold.py
+```
+
+Loads the trained model, runs inference on the held-out 20 % validation split,
+and reports:
+
+| Metric | Description |
+| :--- | :--- |
+| Mean MSE | Mean squared error (lower is better) |
+| Mean PSNR | Peak signal-to-noise ratio in dB (higher is better) |
+| Mean SSIM | Structural similarity index (higher is better) |
+| Mean Corr | Pearson correlation (higher is better) |
+| Overall Quality | Weighted composite score (%) |
+
+Results are saved to `results/resnet_threshold_metrics.json`.
+
+## Inference example
 
 ```python
 import torch
 import numpy as np
 from scipy.signal import resample
-from scripts.train_resunet import ResUNet1D
+from models.resnet_threshold import ResNetThreshold1D
 
-# Load the model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = ResUNet1D().to(device)
-model.load_state_dict(torch.load("models/resunet1d.pth", map_location=device))
+model = ResNetThreshold1D(in_channels=1, hidden_channels=64, num_blocks=8).to(device)
+model.load_state_dict(torch.load("models/resnet_threshold1d.pth", map_location=device, weights_only=True))
 model.eval()
 
-# Load and preprocess your data
-raw_spectrum = np.loadtxt("path/to/your/spectrum.txt")
-raw_spectrum_resampled = resample(raw_spectrum, 1024)
-noisy_tensor = torch.tensor(raw_spectrum_resampled, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device)
+raw_spectrum = np.loadtxt("path/to/your/spectrum.txt")[:, 1]  # intensity column
+resampled = resample(raw_spectrum, 1024).astype(np.float32)
+noisy_tensor = torch.from_numpy(resampled).unsqueeze(0).unsqueeze(0).to(device)
 
-# Denoise
 with torch.no_grad():
     denoised_tensor = model(noisy_tensor)
 
 denoised_spectrum = denoised_tensor.cpu().squeeze().numpy()
 ```
 
-## Training
+## Downstream Evaluation
 
-To train the model from scratch, you can run the `train_resunet.py` script. Make sure your data is in the `data/pairs` directory, with `_clean.npy` and `_noisy.npy` file pairs.
-
-```sh
-python scripts/train_resunet.py
-```
-
-The script will:
-
-  - Split the data into training and validation sets.
-  - Augment the training data by adding noise, baseline shifts, and spikes.
-  - Train the `ResUNet1D` model using a `HybridLoss` function.
-  - Save the trained model to `models/resunet1d.pth`.
-  - Evaluate the model and save the metrics to `results/eval_metrics.json`.
-
-## Evaluation
-
-To evaluate the model on the validation set, you can either run the training script (which includes evaluation at the end) or run the dedicated evaluation script:
-
-```sh
-python scripts/evaluate_model.py
-```
-
-This will load the trained model and compute the following metrics on the validation set:
-
-  - **Mean Squared Error (MSE)**
-  - **Peak Signal-to-Noise Ratio (PSNR)**
-  - **Structural Similarity Index (SSIM)**
-  - **Pearson Correlation**
-
-The results are saved in `results/eval_metrics.json`. The latest evaluation results are:
-
-| Metric | Value |
-| :--- | :--- |
-| Mean MSE | 0.0019 |
-| Mean PSNR | 42.68 dB |
-| Mean SSIM | 0.9927 |
-| Mean Corr | 0.9911 |
-| **Overall Quality** | **95.17%** |
-
-## Demonstration
-
-The following plot, generated by `notebooks/demo_analysis.ipynb`, shows a comparison between the original raw spectrum, the baseline-corrected (but flawed) target, and the model's denoised output.
+Run `scripts/Downstream Task Evaluation.py` to compare the ResNetThreshold1D denoiser
+against Savitzky–Golay and wavelet baselines using a downstream Random Forest classifier.
+Labels must be available in `data/dataset/` (produced by `load_qc.py`).
