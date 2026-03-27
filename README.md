@@ -51,7 +51,7 @@ This project provides a complete pipeline for training and evaluating a 1D ResNe
    ```
 3. **Install dependencies**
    ```sh
-   pip install -r requrements.txt
+   pip install -r requirements.txt
    ```
 
 ## Data Preparation
