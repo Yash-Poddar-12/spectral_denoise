@@ -37,9 +37,9 @@ from models.resnet_threshold import ResNetThreshold1D
 # ---------------------------------------------------------------------------
 PAIRS_DIR = os.path.join(_project_root, "data", "pairs")
 TARGET_LEN = 1024
-BATCH_SIZE = 8
-HIDDEN_CHANNELS = 64
-NUM_BLOCKS = 8
+BATCH_SIZE = 16
+HIDDEN_CHANNELS = 128
+NUM_BLOCKS = 12
 MODEL_PATH = os.path.join(_project_root, "models", "resnet_threshold1d.pth")
 RESULTS_PATH = os.path.join(_project_root, "results", "resnet_threshold_metrics.json")
 
@@ -50,7 +50,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # Dataset (no augmentation for evaluation)
 # ---------------------------------------------------------------------------
 class FTIRPairsDataset(Dataset):
-    """Loads clean/noisy .npy pairs and resamples to ``target_len``."""
+    """Loads clean/noisy .npy pairs and resamples to target_len."""
 
     def __init__(self, clean_files, noisy_files, target_len=TARGET_LEN):
         self.clean_files = clean_files
@@ -69,8 +69,8 @@ class FTIRPairsDataset(Dataset):
         if len(noisy) != self.target_len:
             noisy = resample(noisy, self.target_len).astype(np.float32)
 
-        clean_t = torch.from_numpy(clean).unsqueeze(0)
-        noisy_t = torch.from_numpy(noisy).unsqueeze(0)
+        clean_t = torch.tensor(clean, dtype=torch.float32).unsqueeze(0)
+        noisy_t = torch.tensor(noisy, dtype=torch.float32).unsqueeze(0)
         return noisy_t, clean_t
 
 

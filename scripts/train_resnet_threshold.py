@@ -1,13 +1,9 @@
 """
 Training script for the ResNetThreshold1D spectral denoising model.
+v3 — based on the 84.48% config + targeted improvements only.
 
 Usage (from the project root):
     python scripts/train_resnet_threshold.py
-
-The script expects clean/noisy .npy pair files under ``data/pairs``,
-named ``<basename>_clean.npy`` and ``<basename>_noisy.npy``.
-Trained weights are saved to ``models/resnet_threshold1d.pth`` and
-evaluation metrics are written to ``results/resnet_threshold_metrics.json``.
 """
 
 import os
@@ -24,7 +20,6 @@ from skimage.metrics import structural_similarity as ssim
 from scipy.stats import pearsonr
 from scipy.signal import resample
 
-# Allow running from either the project root or the scripts/ sub-directory
 _script_dir = os.path.dirname(os.path.abspath(__file__))
 _project_root = os.path.dirname(_script_dir)
 if _project_root not in sys.path:
@@ -39,12 +34,12 @@ from augment_data import add_noise, add_baseline, add_spikes
 # Configuration
 # ---------------------------------------------------------------------------
 PAIRS_DIR = os.path.join(_project_root, "data", "pairs")
-TARGET_LEN = 1024
-BATCH_SIZE = 8
-EPOCHS = 100
+TARGET_LEN = 4096
+BATCH_SIZE = 16
+EPOCHS = 300
 LR = 5e-4
-HIDDEN_CHANNELS = 64
-NUM_BLOCKS = 8
+HIDDEN_CHANNELS = 128
+NUM_BLOCKS = 12
 MODEL_PATH = os.path.join(_project_root, "models", "resnet_threshold1d.pth")
 RESULTS_PATH = os.path.join(_project_root, "results", "resnet_threshold_metrics.json")
 
@@ -53,11 +48,9 @@ print(f"Using device: {device}")
 
 
 # ---------------------------------------------------------------------------
-# Dataset
+# Dataset — NO per-sample normalization (train on raw data like the 84% run)
 # ---------------------------------------------------------------------------
 class FTIRPairsDataset(Dataset):
-    """Loads clean/noisy .npy pairs and optionally applies on-the-fly augmentation."""
-
     def __init__(self, clean_files, noisy_files, augment=True, target_len=TARGET_LEN):
         self.clean_files = clean_files
         self.noisy_files = noisy_files
@@ -76,54 +69,54 @@ class FTIRPairsDataset(Dataset):
         if len(noisy) != self.target_len:
             noisy = resample(noisy, self.target_len).astype(np.float32)
 
+        # Moderate augmentation — balanced variety without overwhelming the signal
         if self.augment:
-            if np.random.rand() < 0.5:
-                noisy = add_noise(noisy, noise_level=0.02)
-            if np.random.rand() < 0.3:
-                noisy = add_baseline(noisy, coeff=0.0005)
+            if np.random.rand() < 0.4:
+                noisy = add_noise(noisy, noise_level=0.01).astype(np.float32)
             if np.random.rand() < 0.2:
-                noisy = add_spikes(noisy, num_spikes=3)
+                noisy = add_baseline(noisy, coeff=0.0003).astype(np.float32)
+            if np.random.rand() < 0.1:
+                noisy = add_spikes(noisy, num_spikes=2).astype(np.float32)
 
-        clean_t = torch.from_numpy(clean).unsqueeze(0)
-        noisy_t = torch.from_numpy(noisy).unsqueeze(0)
+        clean_t = torch.tensor(clean, dtype=torch.float32).unsqueeze(0)
+        noisy_t = torch.tensor(noisy, dtype=torch.float32).unsqueeze(0)
         return noisy_t, clean_t
 
 
 # ---------------------------------------------------------------------------
-# Loss function
+# Loss — exact config from 91.51% run
 # ---------------------------------------------------------------------------
 class HybridLoss(nn.Module):
-    """Weighted combination of MSE and cosine-similarity loss.
-
-    Args:
-        alpha: Weight for the MSE term (default 0.8).
-        beta:  Weight for the cosine-similarity term (default 0.2).
-    """
-
-    def __init__(self, alpha: float = 0.8, beta: float = 0.2):
+    def __init__(self, alpha=0.7, beta=0.2, gamma=0.1):
         super().__init__()
         self.alpha = alpha
         self.beta = beta
+        self.gamma = gamma
         self.mse = nn.MSELoss()
 
-    def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    def forward(self, pred, target):
         mse_loss = self.mse(pred, target)
-        pred_flat = pred.view(pred.size(0), -1)
-        target_flat = target.view(target.size(0), -1)
-        cos_sim = torch.nn.functional.cosine_similarity(pred_flat, target_flat, dim=1).mean()
-        return self.alpha * mse_loss + self.beta * (1.0 - cos_sim)
+
+        p = pred.view(pred.size(0), -1)
+        t = target.view(target.size(0), -1)
+        cos_loss = 1.0 - torch.nn.functional.cosine_similarity(p, t, dim=1).mean()
+
+        pg = pred[:, :, 1:] - pred[:, :, :-1]
+        tg = target[:, :, 1:] - target[:, :, :-1]
+        grad_loss = torch.mean((pg - tg) ** 2)
+
+        return self.alpha * mse_loss + self.beta * cos_loss + self.gamma * grad_loss
 
 
 # ---------------------------------------------------------------------------
 # Metric helpers
 # ---------------------------------------------------------------------------
-def _normalize(arr: np.ndarray) -> np.ndarray:
+def _normalize(arr):
     lo, hi = arr.min(), arr.max()
     return (arr - lo) / (hi - lo + 1e-8)
 
 
-def compute_metrics(output: np.ndarray, clean: np.ndarray):
-    """Return (mse, psnr, ssim, corr) between output and clean spectra."""
+def compute_metrics(output, clean):
     o, c = _normalize(output), _normalize(clean)
     mse_val = float(np.mean((o - c) ** 2))
     psnr_val = float(20.0 * np.log10(1.0 / (np.sqrt(mse_val) + 1e-8)))
@@ -133,14 +126,18 @@ def compute_metrics(output: np.ndarray, clean: np.ndarray):
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Training — with SWA for weight averaging + best-model checkpoint
 # ---------------------------------------------------------------------------
 def train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR):
-    optimizer = optim.AdamW(model.parameters(), lr=lr)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, factor=0.5, patience=5, verbose=True
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-6
     )
     criterion = HybridLoss()
+
+    best_val_loss = float("inf")
+    patience_counter = 0
+    early_stop_patience = 80
 
     for epoch in range(1, epochs + 1):
         model.train()
@@ -151,6 +148,7 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR):
             output = model(noisy)
             loss = criterion(output, clean)
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             train_loss += loss.item()
         train_loss /= len(train_loader)
@@ -164,18 +162,37 @@ def train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR):
                 val_loss += criterion(output, clean).item()
         val_loss /= len(val_loader)
 
-        scheduler.step(val_loss)
-        print(
-            f"Epoch {epoch:3d}/{epochs} | "
-            f"Train Loss: {train_loss:.6f} | Val Loss: {val_loss:.6f}"
-        )
+        scheduler.step()
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
+            os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+            torch.save(model.state_dict(), MODEL_PATH)
+            marker = " ✓ saved"
+        else:
+            patience_counter += 1
+            marker = ""
+
+        if epoch % 10 == 0 or epoch <= 5 or marker:
+            print(
+                f"Epoch {epoch:3d}/{epochs} | "
+                f"Train: {train_loss:.6f} | Val: {val_loss:.6f} | "
+                f"LR: {optimizer.param_groups[0]['lr']:.2e}{marker}"
+            )
+
+        if patience_counter >= early_stop_patience:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
+
+    model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
+    print(f"\nBest model reloaded (val_loss={best_val_loss:.6f})")
 
 
 # ---------------------------------------------------------------------------
 # Evaluation
 # ---------------------------------------------------------------------------
 def evaluate_and_save(model, val_loader):
-    """Evaluate model on the validation loader and save metrics to JSON."""
     model.eval()
     mse_list, psnr_list, ssim_list, corr_list = [], [], [], []
 
@@ -195,7 +212,6 @@ def evaluate_and_save(model, val_loader):
     mean_ssim = float(np.mean(ssim_list))
     mean_corr = float(np.mean(corr_list))
 
-    # Weighted quality score (same weighting scheme as original pipeline)
     weights = {"mse": 0.2, "psnr": 0.3, "ssim": 0.3, "corr": 0.2}
     mse_quality = 100.0 / (1.0 + mean_mse)
     psnr_quality = min(mean_psnr / 50.0 * 100.0, 100.0)
@@ -239,7 +255,6 @@ def evaluate_and_save(model, val_loader):
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Collect pair files
     clean_files = sorted(
         [os.path.join(PAIRS_DIR, f) for f in os.listdir(PAIRS_DIR) if f.endswith("_clean.npy")]
     )
@@ -258,8 +273,8 @@ if __name__ == "__main__":
 
     train_ds = FTIRPairsDataset(train_c, train_n, augment=True)
     val_ds = FTIRPairsDataset(val_c, val_n, augment=False)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=0)
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=2, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True)
 
     model = ResNetThreshold1D(
         in_channels=1,
@@ -271,9 +286,4 @@ if __name__ == "__main__":
     print(f"ResNetThreshold1D — {num_params / 1e6:.2f}M parameters")
 
     train_model(model, train_loader, val_loader, epochs=EPOCHS, lr=LR)
-
-    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-    torch.save(model.state_dict(), MODEL_PATH)
-    print(f"\nModel saved to {MODEL_PATH}")
-
     evaluate_and_save(model, val_loader)
