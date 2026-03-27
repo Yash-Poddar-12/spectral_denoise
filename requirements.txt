@@ -1,0 +1,19 @@
+# Model uses PyTorch (ResNetThreshold1D pipeline)
+torch==2.1.0
+torchvision==0.16.0
+
+# Data handling and scientific computing
+numpy==1.24.3
+scipy==1.11.2
+scikit-learn==1.3.1
+scikit-image==0.21.0
+opencv-python==4.8.0.76
+pandas==2.1.0
+PyWavelets==1.4.1
+
+# Plotting and baseline correction
+matplotlib==3.7.2
+pybaselines==1.0.0
+
+# For running notebooks
+jupyter==1.0.0
