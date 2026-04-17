@@ -3,6 +3,7 @@
 *.txt
 /results
 /data
+/snapshots
 notebooks/demo_analysis.ipynb
 
 # Python bytecode and caches
