@@ -1,4 +1,4 @@
-# Model uses PyTorch (ResNetThreshold1D pipeline)
+# Model uses PyTorch (ResUNet1D pipeline)
 torch==2.1.0
 torchvision==0.16.0
 
